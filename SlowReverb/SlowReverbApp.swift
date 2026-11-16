@@ -39,7 +39,7 @@ enum APIKeychain {
 struct Track: Identifiable, Codable, Equatable {
     var id: String { filename }
     let filename: String
-    let title: String
+    var title: String
     var sourceVideoID: String? = nil
     var speed: Double = 0.72
     var reverb: Double = 35
@@ -97,6 +97,15 @@ final class LibraryStore: ObservableObject {
         guard let index = tracks.firstIndex(where: { $0.id == trackID }) else { return }
         tracks[index].speed = min(max(speed, 0.5), 1.0)
         tracks[index].reverb = min(max(reverb, 0), 100)
+        save()
+    }
+
+    func rename(_ track: Track, to newTitle: String) {
+        let cleanedTitle = newTitle.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cleanedTitle.isEmpty,
+              let index = tracks.firstIndex(where: { $0.id == track.id }) else { return }
+        tracks[index].title = cleanedTitle
+        tracks.sort { $0.title.localizedCaseInsensitiveCompare($1.title) == .orderedAscending }
         save()
     }
 
@@ -161,8 +170,12 @@ final class AudioPlayer: ObservableObject {
     private var hasScheduledAudio = false
     private var playbackGeneration: UInt = 0
     private var libraryTracks: [Track] = []
+    private var didAttemptCheckpointRestore = false
+    private var lastCheckpointBucket = -1
     private let remoteCommandCenter = MPRemoteCommandCenter.shared()
     private var lastNowPlayingSecond = -1
+    private let checkpointTrackKey = "playbackCheckpointTrack"
+    private let checkpointPositionKey = "playbackCheckpointPosition"
 
     init() {
         engine.attach(playerNode)
@@ -210,12 +223,20 @@ final class AudioPlayer: ObservableObject {
 
     func setLibraryTracks(_ tracks: [Track]) {
         libraryTracks = tracks
+        if let current, let updated = tracks.first(where: { $0.id == current.id }) {
+            self.current = updated
+        }
+        if !didAttemptCheckpointRestore {
+            didAttemptCheckpointRestore = true
+            restoreCheckpoint(from: tracks)
+        }
         updateRemoteCommandAvailability()
     }
 
     func play(_ track: Track) {
         do {
             if current == track, !isPlaying { resume(); return }
+            saveCheckpoint()
             stopScheduledPlayback()
             timer?.invalidate()
             let file = try AVAudioFile(forReading: track.url)
@@ -223,10 +244,12 @@ final class AudioPlayer: ObservableObject {
             current = track
             duration = Double(file.length) / file.processingFormat.sampleRate
             position = 0
+            lastCheckpointBucket = 0
             lastNowPlayingSecond = -1
             speed = track.speed
             reverb = track.reverb
             startSegment(at: 0)
+            saveCheckpoint()
         } catch {
             isPlaying = false
         }
@@ -242,6 +265,7 @@ final class AudioPlayer: ObservableObject {
         playerNode.pause()
         isPlaying = false
         timer?.invalidate()
+        saveCheckpoint()
         updateNowPlayingInfo()
     }
 
@@ -254,6 +278,7 @@ final class AudioPlayer: ObservableObject {
         current = nil
         position = 0
         duration = 0
+        clearCheckpoint()
         MPNowPlayingInfoCenter.default().nowPlayingInfo = nil
         updateRemoteCommandAvailability()
     }
@@ -272,9 +297,11 @@ final class AudioPlayer: ObservableObject {
         stopScheduledPlayback()
         timer?.invalidate()
         position = target
+        lastCheckpointBucket = Int(position) / 5
         schedule(file, from: target)
         if wasPlaying, hasScheduledAudio { playerNode.play(); isPlaying = true; startTimer() }
         else { isPlaying = false }
+        saveCheckpoint()
         updateNowPlayingInfo()
     }
 
@@ -284,12 +311,14 @@ final class AudioPlayer: ObservableObject {
         if !hasScheduledAudio || position >= duration {
             stopScheduledPlayback()
             position = 0
+            lastCheckpointBucket = 0
             schedule(audioFile, from: position)
         }
         guard hasScheduledAudio else { return }
         playerNode.play()
         isPlaying = true
         startTimer()
+        saveCheckpoint()
         updateNowPlayingInfo()
     }
 
@@ -316,7 +345,9 @@ final class AudioPlayer: ObservableObject {
                 guard let self, self.playbackGeneration == generation else { return }
                 self.isPlaying = false
                 self.hasScheduledAudio = false
+                self.position = self.duration
                 self.timer?.invalidate()
+                self.saveCheckpoint()
                 self.updateNowPlayingInfo()
             }
         }
@@ -326,6 +357,43 @@ final class AudioPlayer: ObservableObject {
         playbackGeneration &+= 1
         playerNode.stop()
         hasScheduledAudio = false
+    }
+
+    func saveCheckpoint() {
+        guard let current else { return }
+        let defaults = UserDefaults.standard
+        defaults.set(current.filename, forKey: checkpointTrackKey)
+        defaults.set(position, forKey: checkpointPositionKey)
+        lastCheckpointBucket = Int(position) / 5
+    }
+
+    private func restoreCheckpoint(from tracks: [Track]) {
+        let defaults = UserDefaults.standard
+        guard let filename = defaults.string(forKey: checkpointTrackKey),
+              let track = tracks.first(where: { $0.filename == filename }) else {
+            clearCheckpoint()
+            return
+        }
+        do {
+            let file = try AVAudioFile(forReading: track.url)
+            audioFile = file
+            current = track
+            duration = Double(file.length) / file.processingFormat.sampleRate
+            let savedPosition = defaults.double(forKey: checkpointPositionKey)
+            position = savedPosition >= duration ? 0 : min(max(savedPosition, 0), duration)
+            lastCheckpointBucket = Int(position) / 5
+            speed = track.speed
+            reverb = track.reverb
+            schedule(file, from: position)
+            updateNowPlayingInfo()
+        } catch {
+            clearCheckpoint()
+        }
+    }
+
+    private func clearCheckpoint() {
+        UserDefaults.standard.removeObject(forKey: checkpointTrackKey)
+        UserDefaults.standard.removeObject(forKey: checkpointPositionKey)
     }
 
     private func updateRemoteCommandAvailability() {
@@ -367,11 +435,13 @@ final class AudioPlayer: ObservableObject {
                 if self.position >= self.duration {
                     self.isPlaying = false
                     self.timer?.invalidate()
+                    self.saveCheckpoint()
                     self.updateNowPlayingInfo()
                 } else if Int(self.position) != self.lastNowPlayingSecond {
                     self.lastNowPlayingSecond = Int(self.position)
                     self.updateNowPlayingInfo()
                 }
+                if Int(self.position) / 5 != self.lastCheckpointBucket { self.saveCheckpoint() }
             }
         }
     }
@@ -481,6 +551,7 @@ struct SlowReverbApp: App {
 struct MainView: View {
     @EnvironmentObject private var library: LibraryStore
     @EnvironmentObject private var player: AudioPlayer
+    @Environment(\.scenePhase) private var scenePhase
     @State private var selectedTab = 0
     @State private var showingImporter = false
     @State private var alertMessage: String?
@@ -496,6 +567,9 @@ struct MainView: View {
         }
         .onAppear { player.setLibraryTracks(library.tracks) }
         .onChange(of: library.tracks) { _, tracks in player.setLibraryTracks(tracks) }
+        .onChange(of: scenePhase) { _, phase in
+            if phase != .active { player.saveCheckpoint() }
+        }
         .fileImporter(isPresented: $showingImporter, allowedContentTypes: [.audio], allowsMultipleSelection: true) { result in
             do {
                 for url in try result.get() { try library.importFile(from: url) }
@@ -512,6 +586,9 @@ struct LibraryView: View {
     @EnvironmentObject private var player: AudioPlayer
     @Binding var showingImporter: Bool
     @State private var query = ""
+    @State private var showingRename = false
+    @State private var trackToRename: Track?
+    @State private var renameTitle = ""
     private var filtered: [Track] { library.tracks.filter { query.isEmpty || $0.title.localizedCaseInsensitiveContains(query) } }
 
     var body: some View {
@@ -521,14 +598,42 @@ struct LibraryView: View {
                     ContentUnavailableView(query.isEmpty ? "Your library is empty" : "No matching songs", systemImage: "music.note", description: Text(query.isEmpty ? "Import an audio file or search for a song." : "Try a different search."))
                 } else {
                     List(filtered) { track in
-                        Button { player.play(track) } label: { TrackRow(track: track, isPlaying: player.current == track && player.isPlaying) }
-                            .buttonStyle(.plain)
+                        HStack(spacing: 8) {
+                            Button { player.play(track) } label: { TrackRow(track: track, isPlaying: player.current == track && player.isPlaying) }
+                                .buttonStyle(.plain)
+                            Menu {
+                                Button("Rename", systemImage: "pencil") {
+                                    trackToRename = track
+                                    renameTitle = track.title
+                                    showingRename = true
+                                }
+                                Button("Delete", systemImage: "trash", role: .destructive) { library.remove(track) }
+                            } label: {
+                                Image(systemName: "ellipsis")
+                                    .font(.body.weight(.semibold))
+                                    .foregroundStyle(.secondary)
+                                    .frame(width: 32, height: 44)
+                                    .contentShape(Rectangle())
+                            }
+                            .accessibilityLabel("Song options")
+                        }
                             .swipeActions { Button("Delete", role: .destructive) { library.remove(track) } }
                     }.listStyle(.plain)
                 }
             }
             .navigationTitle("My Songs")
             .searchable(text: $query, prompt: "Search your songs")
+            .alert("Rename song", isPresented: $showingRename) {
+                TextField("Song name", text: $renameTitle)
+                Button("Cancel", role: .cancel) { trackToRename = nil }
+                Button("Save") {
+                    if let trackToRename { library.rename(trackToRename, to: renameTitle) }
+                    trackToRename = nil
+                }
+                .disabled(renameTitle.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            } message: {
+                Text("Choose a name for this song.")
+            }
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
                     Button { showingImporter = true } label: { Image(systemName: "plus") }.accessibilityLabel("Import audio")
