@@ -696,12 +696,50 @@ struct MiniPlayer: View {
     }
 }
 
+struct EffectPreset: Identifiable {
+    let name: String
+    let speed: Double
+    let reverb: Double
+    var id: String { name }
+
+    static let all: [EffectPreset] = [
+        EffectPreset(name: "Original", speed: 1.00, reverb: 0),
+        EffectPreset(name: "Subtle", speed: 0.90, reverb: 20),
+        EffectPreset(name: "Slow Jam", speed: 0.75, reverb: 40),
+        EffectPreset(name: "Dreamy", speed: 0.65, reverb: 70),
+        EffectPreset(name: "Washed Out", speed: 0.60, reverb: 90)
+    ]
+}
+
 struct EffectsView: View {
     @EnvironmentObject private var library: LibraryStore
     @EnvironmentObject private var player: AudioPlayer
     var body: some View {
         NavigationStack {
             Form {
+                Section("Presets") {
+                    ForEach(EffectPreset.all) { preset in
+                        Button {
+                            player.speed = preset.speed
+                            player.reverb = preset.reverb
+                            saveSettings()
+                        } label: {
+                            HStack {
+                                VStack(alignment: .leading, spacing: 3) {
+                                    Text(preset.name).foregroundStyle(.primary)
+                                    Text("\(preset.speed, specifier: "%.2f")× speed · \(Int(preset.reverb))% reverb")
+                                        .font(.caption).foregroundStyle(.secondary)
+                                }
+                                Spacer()
+                                if abs(player.speed - preset.speed) < 0.005 && Int(player.reverb.rounded()) == Int(preset.reverb) {
+                                    Image(systemName: "checkmark").foregroundStyle(.orange)
+                                }
+                            }
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
                 Section("Slow") {
                     HStack { Text("Speed"); Spacer(); Text("\(player.speed, specifier: "%.2f")×").foregroundStyle(.secondary) }
                     Slider(value: $player.speed, in: 0.5...1.0, step: 0.01)
