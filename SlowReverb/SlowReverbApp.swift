@@ -158,6 +158,7 @@ final class AudioPlayer: ObservableObject {
     private var audioFile: AVAudioFile?
     private var timer: Timer?
     private var hasScheduledAudio = false
+    private var playbackGeneration: UInt = 0
 
     init() {
         engine.attach(playerNode)
@@ -175,9 +176,8 @@ final class AudioPlayer: ObservableObject {
     func play(_ track: Track) {
         do {
             if current == track, !isPlaying { resume(); return }
-            playerNode.stop()
+            stopScheduledPlayback()
             timer?.invalidate()
-            hasScheduledAudio = false
             let file = try AVAudioFile(forReading: track.url)
             audioFile = file
             current = track
@@ -197,10 +197,9 @@ final class AudioPlayer: ObservableObject {
     }
 
     func stopAndClear() {
-        playerNode.stop()
+        stopScheduledPlayback()
         timer?.invalidate()
         timer = nil
-        hasScheduledAudio = false
         audioFile = nil
         isPlaying = false
         current = nil
@@ -219,21 +218,23 @@ final class AudioPlayer: ObservableObject {
         guard let file = audioFile else { return }
         let target = min(max(seconds, 0), duration)
         let wasPlaying = isPlaying
-        playerNode.stop()
+        stopScheduledPlayback()
         timer?.invalidate()
         position = target
         schedule(file, from: target)
-        if wasPlaying { playerNode.play(); isPlaying = true; startTimer() }
+        if wasPlaying, hasScheduledAudio { playerNode.play(); isPlaying = true; startTimer() }
+        else { isPlaying = false }
     }
 
     private func resume() {
         guard let audioFile else { return }
         if !engine.isRunning { try? engine.start() }
         if !hasScheduledAudio || position >= duration {
-            playerNode.stop()
+            stopScheduledPlayback()
             position = 0
             schedule(audioFile, from: position)
         }
+        guard hasScheduledAudio else { return }
         playerNode.play()
         isPlaying = true
         startTimer()
@@ -242,20 +243,34 @@ final class AudioPlayer: ObservableObject {
     private func startSegment(at seconds: Double) {
         if !engine.isRunning { try? engine.start() }
         schedule(audioFile!, from: seconds)
+        guard hasScheduledAudio else { return }
         playerNode.play()
         isPlaying = true
         startTimer()
     }
 
     private func schedule(_ file: AVAudioFile, from seconds: Double) {
+        playbackGeneration &+= 1
+        let generation = playbackGeneration
         let sampleRate = file.processingFormat.sampleRate
         let startFrame = AVAudioFramePosition(seconds * sampleRate)
         let remaining = max(0, file.length - startFrame)
         guard remaining > 0 else { isPlaying = false; hasScheduledAudio = false; return }
         hasScheduledAudio = true
         playerNode.scheduleSegment(file, startingFrame: startFrame, frameCount: AVAudioFrameCount(remaining), at: nil) { [weak self] in
-            Task { @MainActor in self?.isPlaying = false; self?.hasScheduledAudio = false; self?.timer?.invalidate() }
+            Task { @MainActor [weak self] in
+                guard let self, self.playbackGeneration == generation else { return }
+                self.isPlaying = false
+                self.hasScheduledAudio = false
+                self.timer?.invalidate()
+            }
         }
+    }
+
+    private func stopScheduledPlayback() {
+        playbackGeneration &+= 1
+        playerNode.stop()
+        hasScheduledAudio = false
     }
 
     private func startTimer() {
