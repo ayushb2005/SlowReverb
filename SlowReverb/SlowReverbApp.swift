@@ -2,6 +2,7 @@ import AVFoundation
 import SwiftUI
 import UniformTypeIdentifiers
 import Security
+import MediaPlayer
 
 enum APIKeychain {
     private static let service = Bundle.main.bundleIdentifier ?? "com.personal.slowreverb"
@@ -159,6 +160,9 @@ final class AudioPlayer: ObservableObject {
     private var timer: Timer?
     private var hasScheduledAudio = false
     private var playbackGeneration: UInt = 0
+    private var libraryTracks: [Track] = []
+    private let remoteCommandCenter = MPRemoteCommandCenter.shared()
+    private var lastNowPlayingSecond = -1
 
     init() {
         engine.attach(playerNode)
@@ -171,6 +175,42 @@ final class AudioPlayer: ObservableObject {
         reverbUnit.wetDryMix = Float(reverb)
         try? AVAudioSession.sharedInstance().setCategory(.playback, mode: .default, options: [])
         try? AVAudioSession.sharedInstance().setActive(true)
+        configureRemoteCommands()
+    }
+
+    private func configureRemoteCommands() {
+        remoteCommandCenter.playCommand.addTarget { [weak self] _ in
+            Task { @MainActor [weak self] in self?.resume() }
+            return .success
+        }
+        remoteCommandCenter.pauseCommand.addTarget { [weak self] _ in
+            Task { @MainActor [weak self] in self?.pause() }
+            return .success
+        }
+        remoteCommandCenter.togglePlayPauseCommand.addTarget { [weak self] _ in
+            Task { @MainActor [weak self] in self?.toggle() }
+            return .success
+        }
+        remoteCommandCenter.previousTrackCommand.addTarget { [weak self] _ in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.playNext(in: self.libraryTracks, direction: -1)
+            }
+            return .success
+        }
+        remoteCommandCenter.nextTrackCommand.addTarget { [weak self] _ in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.playNext(in: self.libraryTracks)
+            }
+            return .success
+        }
+        updateRemoteCommandAvailability()
+    }
+
+    func setLibraryTracks(_ tracks: [Track]) {
+        libraryTracks = tracks
+        updateRemoteCommandAvailability()
     }
 
     func play(_ track: Track) {
@@ -183,6 +223,7 @@ final class AudioPlayer: ObservableObject {
             current = track
             duration = Double(file.length) / file.processingFormat.sampleRate
             position = 0
+            lastNowPlayingSecond = -1
             speed = track.speed
             reverb = track.reverb
             startSegment(at: 0)
@@ -192,8 +233,16 @@ final class AudioPlayer: ObservableObject {
     }
 
     func toggle() {
-        if isPlaying { playerNode.pause(); isPlaying = false; timer?.invalidate() }
+        if isPlaying { pause() }
         else if current != nil { resume() }
+    }
+
+    private func pause() {
+        guard current != nil else { return }
+        playerNode.pause()
+        isPlaying = false
+        timer?.invalidate()
+        updateNowPlayingInfo()
     }
 
     func stopAndClear() {
@@ -205,6 +254,8 @@ final class AudioPlayer: ObservableObject {
         current = nil
         position = 0
         duration = 0
+        MPNowPlayingInfoCenter.default().nowPlayingInfo = nil
+        updateRemoteCommandAvailability()
     }
 
     func playNext(in tracks: [Track], direction: Int = 1) {
@@ -224,6 +275,7 @@ final class AudioPlayer: ObservableObject {
         schedule(file, from: target)
         if wasPlaying, hasScheduledAudio { playerNode.play(); isPlaying = true; startTimer() }
         else { isPlaying = false }
+        updateNowPlayingInfo()
     }
 
     private func resume() {
@@ -238,6 +290,7 @@ final class AudioPlayer: ObservableObject {
         playerNode.play()
         isPlaying = true
         startTimer()
+        updateNowPlayingInfo()
     }
 
     private func startSegment(at seconds: Double) {
@@ -247,6 +300,7 @@ final class AudioPlayer: ObservableObject {
         playerNode.play()
         isPlaying = true
         startTimer()
+        updateNowPlayingInfo()
     }
 
     private func schedule(_ file: AVAudioFile, from seconds: Double) {
@@ -263,6 +317,7 @@ final class AudioPlayer: ObservableObject {
                 self.isPlaying = false
                 self.hasScheduledAudio = false
                 self.timer?.invalidate()
+                self.updateNowPlayingInfo()
             }
         }
     }
@@ -273,13 +328,50 @@ final class AudioPlayer: ObservableObject {
         hasScheduledAudio = false
     }
 
+    private func updateRemoteCommandAvailability() {
+        let hasTrack = current != nil
+        remoteCommandCenter.playCommand.isEnabled = hasTrack
+        remoteCommandCenter.pauseCommand.isEnabled = hasTrack
+        remoteCommandCenter.togglePlayPauseCommand.isEnabled = hasTrack
+        let canSkip = hasTrack && libraryTracks.count > 1
+        remoteCommandCenter.previousTrackCommand.isEnabled = canSkip
+        remoteCommandCenter.nextTrackCommand.isEnabled = canSkip
+    }
+
+    private func updateNowPlayingInfo() {
+        guard let current else {
+            MPNowPlayingInfoCenter.default().nowPlayingInfo = nil
+            updateRemoteCommandAvailability()
+            return
+        }
+        var info: [String: Any] = [
+            MPMediaItemPropertyTitle: current.title,
+            MPMediaItemPropertyMediaType: MPMediaType.music.rawValue,
+            MPMediaItemPropertyPlaybackDuration: duration,
+            MPNowPlayingInfoPropertyElapsedPlaybackTime: position,
+            MPNowPlayingInfoPropertyPlaybackRate: isPlaying ? speed : 0,
+            MPNowPlayingInfoPropertyDefaultPlaybackRate: speed
+        ]
+        info[MPMediaItemPropertyArtist] = "SlowReverb"
+        MPNowPlayingInfoCenter.default().nowPlayingInfo = info
+        MPNowPlayingInfoCenter.default().playbackState = isPlaying ? .playing : .paused
+        updateRemoteCommandAvailability()
+    }
+
     private func startTimer() {
         timer?.invalidate()
         timer = Timer.scheduledTimer(withTimeInterval: 0.2, repeats: true) { [weak self] _ in
             Task { @MainActor [weak self] in
                 guard let self, self.isPlaying else { return }
                 self.position = min(self.duration, self.position + 0.2 * self.speed)
-                if self.position >= self.duration { self.isPlaying = false; self.timer?.invalidate() }
+                if self.position >= self.duration {
+                    self.isPlaying = false
+                    self.timer?.invalidate()
+                    self.updateNowPlayingInfo()
+                } else if Int(self.position) != self.lastNowPlayingSecond {
+                    self.lastNowPlayingSecond = Int(self.position)
+                    self.updateNowPlayingInfo()
+                }
             }
         }
     }
@@ -402,6 +494,8 @@ struct MainView: View {
         .safeAreaInset(edge: .bottom, spacing: 0) {
             if let current = player.current { MiniPlayer(track: current) }
         }
+        .onAppear { player.setLibraryTracks(library.tracks) }
+        .onChange(of: library.tracks) { _, tracks in player.setLibraryTracks(tracks) }
         .fileImporter(isPresented: $showingImporter, allowedContentTypes: [.audio], allowsMultipleSelection: true) { result in
             do {
                 for url in try result.get() { try library.importFile(from: url) }
